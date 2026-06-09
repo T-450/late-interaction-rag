@@ -1,0 +1,28 @@
+# Late-Interaction RAG — Dependencies
+# Install: pip install -r requirements.txt
+
+# Core late-interaction retrieval
+ragatouille>=1.0          # ColBERT-based RAG (easiest to start)
+pylate>=0.5               # PyLate by LightOn (training + FastPLAID)
+
+# Alternative models
+sentence-transformers>=3.0  # For Jina-ColBERT-v2 etc.
+
+# Visual document retrieval
+# colpali-rag               # ColPali (uncomment when available)
+# pdf2image                  # PDF to images for ColPali
+
+# First-stage retrieval
+bm25s>=0.1                # BM25 for hybrid pipelines
+stemmer>=2.0              # English stemmer for BM25
+
+# Evaluation
+beir>=2.0                 # BEIR benchmark suite
+
+# ML dependencies
+torch>=2.0                 # PyTorch
+numpy>=1.24               # NumPy
+
+# Utilities
+tqdm>=4.65                # Progress bars
+datasets>=2.14            # HuggingFace datasets
