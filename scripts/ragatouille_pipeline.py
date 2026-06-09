@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Complete late-interaction RAG pipeline using RAGatouille (ColBERT).
+Late-interaction RAG pipeline using PyLate (ColBERT) with manual MaxSim scoring.
 
-Demonstrates indexing, search, and reranking.
+Demonstrates: model loading, token embedding extraction, MaxSim search,
+and BM25 + ColBERT hybrid reranking.
 
-Install: pip install ragatouille bm25s stemmer
+Install: pip install pylate bm25s stemmer
 Run: python scripts/ragatouille_pipeline.py
 """
 
-from ragatouille import RAGPretrainedModel
 import time
+import numpy as np
 from typing import List, Dict
 
 
@@ -35,59 +36,86 @@ QUERIES = [
     "serving large language models efficiently",
 ]
 
-EXPECTED_MATCHES = {
-    "how to reduce GPU memory during inference": [0, 1, 3, 4, 5],
-    "techniques for faster transformer decoding speed": [2, 5, 6, 8],
-    "memory efficient attention mechanisms for long sequences": [1, 3, 5],
-    "methods to reduce model size for deployment": [4, 7, 9],
-    "serving large language models efficiently": [5, 6, 9, 8],
-}
+
+def maxsim_score(query_emb: np.ndarray, doc_emb: np.ndarray) -> float:
+    """ColBERT MaxSim: sum of max cos similarities per query token."""
+    # Normalize for cosine similarity
+    q_norm = query_emb / (np.linalg.norm(query_emb, axis=1, keepdims=True) + 1e-10)
+    d_norm = doc_emb / (np.linalg.norm(doc_emb, axis=1, keepdims=True) + 1e-10)
+    # Similarity matrix (n_query_tokens, n_doc_tokens)
+    sim = np.dot(q_norm, d_norm.T)
+    # Max per query token, then sum
+    return float(sim.max(axis=1).sum())
 
 
-def build_and_index(corpus: List[str]) -> RAGPretrainedModel:
-    """Index documents with ColBERTv2."""
-    print("Loading ColBERTv2 model...")
+def load_model():
+    """Load a ColBERT model."""
+    from pylate import models
+    print("Loading ColBERT model (answerai-colbert-small-v1)...")
     start = time.time()
-    RAG = RAGPretrainedModel.from_pretrained("colbert-ir/colbertv2.0")
-    print(f"  Model loaded in {time.time() - start:.2f}s")
+    model = models.ColBERT(model_name_or_path="answerdotai/answerai-colbert-small-v1")
+    print(f"  Loaded in {time.time() - start:.2f}s")
+    return model
 
-    print("\nIndexing corpus...")
+
+def token_embeddings(model, texts: List[str]) -> List[np.ndarray]:
+    """Get per-token embeddings for a list of texts."""
+    return model.encode(texts)  # List of (n_tokens, dim) numpy arrays
+
+
+def build_index(corpus: List[str], model) -> List[np.ndarray]:
+    """Pre-compute token embeddings for all documents."""
+    print(f"\nIndexing {len(corpus)} documents...")
     start = time.time()
-    RAG.index(
-        collection=corpus,
-        index_name="ml_optimization",
-        max_document_length=256,
-        split_documents=False,
-        overwrite_index=True,
-    )
-    print(f"  Indexed {len(corpus)} documents in {time.time() - start:.2f}s")
-    return RAG
+    doc_embeddings = token_embeddings(model, corpus)
+    elapsed = time.time() - start
+    print(f"  Indexed in {elapsed:.2f}s")
+    total_tokens = sum(emb.shape[0] for emb in doc_embeddings)
+    print(f"  Total token vectors: {total_tokens}")
+    print(f"  Avg tokens per doc: {total_tokens / len(corpus):.0f}")
+    return doc_embeddings
 
 
-def search(rag: RAGPretrainedModel, queries: List[str], k: int = 5):
-    """Search and show results for each query."""
+def search(query: str, model, doc_embeddings: List[np.ndarray],
+           corpus: List[str], k: int = 5) -> List[Dict]:
+    """Search using MaxSim scoring."""
+    start = time.time()
+    q_emb = token_embeddings(model, [query])[0]
+
+    scores = [maxsim_score(q_emb, d_emb) for d_emb in doc_embeddings]
+    elapsed = time.time() - start
+
+    top_indices = np.argsort(scores)[::-1][:k]
+    results = []
+    for idx in top_indices:
+        results.append({
+            "rank": len(results) + 1,
+            "score": scores[idx],
+            "content": corpus[idx],
+            "index": int(idx),
+        })
+
+    print(f"  Retrieved in {elapsed*1000:.1f}ms")
+    return results
+
+
+def run_searches(model, doc_embeddings):
+    """Run all predefined queries."""
     print("\n" + "=" * 60)
     print("SEARCH RESULTS")
     print("=" * 60)
 
-    for query in queries:
+    for query in QUERIES:
         print(f"\n--- Query: '{query}' ---")
-        start = time.time()
-        results = rag.search(query=query, k=k)
-        elapsed = time.time() - start
-
-        print(f"  Retrieved in {elapsed*1000:.1f}ms")
-        for i, r in enumerate(results):
-            rank = r.get("rank", i + 1)
-            score = r.get("score", 0.0)
-            content = r.get("content", "")[:100]
-            print(f"  [{rank}] ({score:.4f}) {content}...")
+        results = search(query, model, doc_embeddings, CORPUS, k=3)
+        for r in results:
+            print(f"  [{r['rank']}] ({r['score']:.4f}) {r['content'][:90]}...")
 
 
-def rerank_demo(rag: RAGPretrainedModel):
-    """Demonstrate ColBERT as a reranker over BM25 candidates."""
+def rerank_demo(model, doc_embeddings):
+    """BM25 first-pass, then ColBERT rerank."""
     print("\n" + "=" * 60)
-    print("RERANKING DEMO (BM25 -> ColBERT)")
+    print("HYBRID: BM25 -> ColBERT RERANK")
     print("=" * 60)
 
     try:
@@ -97,67 +125,71 @@ def rerank_demo(rag: RAGPretrainedModel):
         query = "attention memory optimization"
         stemmer = Stemmer.Stemmer("english")
 
-        # BM25 first-stage retrieval
+        # BM25 first stage
         bm25 = bm25s.BM25()
         tokenized = bm25s.tokenize(CORPUS, stemmer=stemmer)
         bm25.index(tokenized)
 
         tokenized_q = bm25s.tokenize(query, stemmer=stemmer)
         bm25_results, bm25_scores = bm25.retrieve(tokenized_q, k=5)
-        candidates = [CORPUS[idx] for idx in bm25_results[0]]
+        candidate_indices = bm25_results[0].tolist()
 
         print(f"\nQuery: '{query}'")
-        print(f"BM25 candidates:")
-        for i, (doc, score) in enumerate(zip(candidates, bm25_scores[0])):
-            print(f"  [{i+1}] (BM25={score:.2f}) {doc[:80]}...")
+        print("BM25 top-5:")
+        for i, idx in enumerate(candidate_indices):
+            print(f"  [{i+1}] (BM25={bm25_scores[0][i]:.1f}) {CORPUS[idx][:80]}...")
 
-        # ColBERT rerank
-        start = time.time()
-        reranked = rag.rerank(query=query, documents=candidates, k=5)
-        elapsed = time.time() - start
+        # ColBERT rerank using MaxSim
+        q_emb = token_embeddings(model, [query])[0]
+        reranked = sorted(
+            [(idx, maxsim_score(q_emb, doc_embeddings[idx])) for idx in candidate_indices],
+            key=lambda x: x[1],
+            reverse=True,
+        )
 
-        print(f"\nColBERT reranked ({elapsed*1000:.1f}ms):")
-        for i, r in enumerate(reranked):
-            print(f"  [{i+1}] ({r['score']:.4f}) {r['content'][:80]}...")
+        print("\nColBERT reranked:")
+        for i, (idx, score) in enumerate(reranked):
+            print(f"  [{i+1}] ({score:.4f}) {CORPUS[idx][:80]}...")
 
     except ImportError:
-        print("bm25s and/or Stemmer not installed. Skipping reranking demo.")
-        print("Install: pip install bm25s stemmer")
+        print("bm25s/stemmer not installed. pip install bm25s stemmer")
 
 
-def save_load_demo(rag: RAGPretrainedModel):
-    """Demonstrate saving and reloading the index."""
+def save_load_demo(model, doc_embeddings, corpus):
+    """Save embeddings to disk and reload."""
     print("\n" + "=" * 60)
     print("SAVE/LOAD DEMO")
     print("=" * 60)
 
-    # Re-index with save
-    print("\nRe-indexing and saving...")
-    rag.index(
-        collection=CORPUS,
-        index_name="ml_optimization",
-        overwrite_index=True,
-    )
+    import pickle, os
+
+    # Save
+    save_dir = "./indexes/ml_optimization"
+    os.makedirs(save_dir, exist_ok=True)
+    with open(f"{save_dir}/embeddings.pkl", "wb") as f:
+        pickle.dump({"corpus": corpus, "embeddings": doc_embeddings}, f)
+    print(f"  Saved to {save_dir}/")
 
     # Reload
-    print("Loading from saved index...")
     start = time.time()
-    rag_loaded = RAGPretrainedModel.from_index(
-        ".ragatouille/colbert/indexes/ml_optimization"
-    )
+    with open(f"{save_dir}/embeddings.pkl", "rb") as f:
+        data = pickle.load(f)
     print(f"  Reloaded in {time.time() - start:.2f}s")
 
-    # Verify with a query
-    results = rag_loaded.search(query="model quantization", k=3)
-    print("  Query after reload: 'model quantization'")
-    for r in results:
-        print(f"    [{r['score']:.4f}] {r['content'][:80]}...")
+    # Verify
+    q_emb = token_embeddings(model, ["model quantization"])[0]
+    scores = [maxsim_score(q_emb, d) for d in data["embeddings"]]
+    top_idx = np.argmax(scores)
+    print(f"  Query: 'model quantization'")
+    print(f"  Best match ({scores[top_idx]:.4f}): {data['corpus'][top_idx][:80]}...")
 
 
 if __name__ == "__main__":
-    rag_model = build_and_index(CORPUS)
-    search(rag_model, QUERIES, k=5)
-    rerank_demo(rag_model)
-    save_load_demo(rag_model)
+    model = load_model()
+    doc_embeddings = build_index(CORPUS, model)
+
+    run_searches(model, doc_embeddings)
+    rerank_demo(model, doc_embeddings)
+    save_load_demo(model, doc_embeddings, CORPUS)
 
     print("\nDone!")
